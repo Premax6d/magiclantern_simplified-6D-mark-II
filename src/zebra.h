@@ -71,6 +71,9 @@ int handle_livev_playback(struct event * event);
 /* focus peaking */
 int is_focus_peaking_enabled();
 int focus_peaking_as_display_filter();
+#if defined(CONFIG_6D2) && defined(FEATURE_FOCUS_PEAK)
+void focus_peaking_handle_button_event(struct event * event);
+#endif
 void peak_disp_filter();    /* CBR called from tweaks.c */
 
 /* spotmeter */

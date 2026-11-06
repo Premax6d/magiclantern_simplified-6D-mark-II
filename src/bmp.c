@@ -269,12 +269,6 @@ void refresh_yuv_from_rgb(void)
     ml_refresh_display_needed = 0;
 }
 
-void rgba_buffer_clear()
-{
-    if (rgb_vram_info == NULL) return;
-    bzero32(rgb_vram_info->bitmap_data, BMP_VRAM_SIZE*4);
-}
-
 #if defined(CONFIG_INSTALLER)
 // Normally in tasks.c, which installer builds don't include.
 // Unused, just need it defined to build.
@@ -315,7 +309,8 @@ static uint32_t indexed2rgbLUT[RGB_LUT_SIZE] = {
     0xff8e8e8e, 0xff939393, 0xff989898, 0xff9c9c9c, 0xffa1a1a1, // 60
     0xffa5a5a5, 0xffaaaaaa, 0xffafafaf, 0xffb3b3b3, 0xffb8b8b8, // 65
     0xffbcbcbc, 0xffc1c1c1, 0xffc6c6c6, 0xffcacaca, 0xffcfcfcf, // 70
-    0xffd3d3d3, 0xffd8d8d8, 0xffdddddd, 0xffe1e1e1, 0xffe6e6e6  // 75
+    0xffd3d3d3, 0xffd8d8d8, 0xffdddddd, 0xffe1e1e1, 0xffe6e6e6, // 75
+    0x38ff0000, 0x58ff0000, 0x78ff0000, 0x98ff0000              // 76-79: selectable soft-red opacity
 };
 
 
@@ -732,11 +727,10 @@ getfilesize_fail:
 void clrscr()
 {
     BMP_LOCK( bmp_fill( 0x0, BMP_W_MINUS, BMP_H_MINUS, BMP_TOTAL_WIDTH, BMP_TOTAL_HEIGHT ); )
-    #ifdef FEATURE_VRAM_RGBA
-    // clear RGBA buffer
-    rgba_buffer_clear();
+    #ifdef CONFIG_COMPOSITOR_DEDICATED_LAYER
+    // clear our layer
+    compositor_layer_clear();
     #endif
-
 }
 
 // this is slow, but is good for a small number of pixels :)

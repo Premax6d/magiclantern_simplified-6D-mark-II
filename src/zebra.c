@@ -31,6 +31,7 @@
 #include "config.h"
 #include "menu.h"
 #include "property.h"
+#include "gui-common.h"
 #include "gui.h"
 #include "lens.h"
 #include "math.h"
@@ -53,6 +54,18 @@
 #endif
 
 extern uint32_t ml_refresh_display_needed;
+
+/* RGBA-layer cameras need overlays drawn into ML's indexed staging buffer.
+ * bmp_vram_real() points to a 32-bit layer, while zebra/focus code indexes
+ * pixels as 8-bit values. */
+static inline uint8_t * zebra_overlay_vram(void)
+{
+#ifdef FEATURE_VRAM_RGBA
+    return bmp_vram();
+#else
+    return bmp_vram_real();
+#endif
+}
 
 #if defined(FEATURE_RAW_HISTOGRAM) || defined(FEATURE_RAW_ZEBRAS) || defined(FEATURE_RAW_SPOTMETER)
 #define FEATURE_RAW_OVERLAYS
@@ -87,6 +100,7 @@ static void schedule_transparent_overlay();
 //~ static void defish_draw();
 //~ static void defish_draw_lv_color();
 static int zebra_color_word_row(int c, int y);
+static int zebra_line_color_word(int c, int y);
 static void spotmeter_step();
 static int zebra_rgb_color(int underexposed, int clipR, int clipG, int clipB, int y);
 static int zebra_rgb_solid_color(int underexposed, int clipR, int clipG, int clipB);
@@ -306,9 +320,24 @@ int nondigic_zoom_overlay_enabled()
 static CONFIG_INT( "focus.peaking", focus_peaking, 0);
 //~ static CONFIG_INT( "focus.peaking.method", focus_peaking_method, 1);
 static CONFIG_INT( "focus.peaking.filter.edges", focus_peaking_filter_edges, 0); // prefer texture details rather than strong edges
-static CONFIG_INT( "focus.peaking.thr", focus_peaking_pthr, 5); // 1%
-static CONFIG_INT( "focus.peaking.color", focus_peaking_color, 7); // R,G,B,C,M,Y,cc1,cc2
+static CONFIG_INT( "focus.peaking.thr", focus_peaking_pthr, 5); // 0.5%
+static CONFIG_INT( "focus.peaking.color", focus_peaking_color, 0); // fixed red by default
 CONFIG_INT( "focus.peaking.grayscale", focus_peaking_grayscale, 0); // R,G,B,C,M,Y,cc1,cc2
+
+#ifdef CONFIG_6D2
+static CONFIG_INT( "focus.peaking.buffer", focus_peak_buffer_source, 0);
+static CONFIG_INT( "focus.peaking.alpha", focus_peaking_alpha, 2);
+
+uint32_t focus_peak_buffer_source_address(void)
+{
+    switch (focus_peak_buffer_source)
+    {
+        case 1: return YUV422_LV_BUFFER_2;
+        case 2: return YUV422_LV_BUFFER_3;
+        default: return YUV422_LV_BUFFER_1;
+    }
+}
+#endif
 
 #if defined(CONFIG_DISPLAY_FILTERS) && defined(FEATURE_FOCUS_PEAK_DISP_FILTER)
 static CONFIG_INT( "focus.peaking.disp", focus_peaking_disp, 0); // display as dots or blended
@@ -316,10 +345,52 @@ static CONFIG_INT( "focus.peaking.disp", focus_peaking_disp, 0); // display as d
 #define focus_peaking_disp 0
 #endif
 
+static int focus_peaking_is_paused()
+{
+    if (!focus_peaking) return 0;
+    /* Global Draw is active on the configured LiveView overlay screen only. */
+    return lv && (!get_global_draw() || gui_menu_shown());
+}
+
+static int focus_peaking_capture_paused = 0;
+
+void focus_peaking_handle_button_event(struct event * event)
+{
+#ifdef CONFIG_6D2
+    /* After the full press, remain off through image capture/save. Re-arm
+     * only when the shutter is fully released, so focus is user-triggered
+     * again on the next half-press. */
+    if (event->param == BGMT_PRESS_FULLSHUTTER)
+        focus_peaking_capture_paused = 1;
+    else if (event->param == BGMT_PRESS_HALFSHUTTER ||
+             event->param == BGMT_UNPRESS_HALFSHUTTER)
+        focus_peaking_capture_paused = 0;
+#else
+    (void)event;
+#endif
+}
+
+static int focus_peaking_trigger_active()
+{
+    return get_halfshutter_pressed() && !focus_peaking_capture_paused;
+}
+
+/* On the 6D2, make zebras follow the same shutter/page gating as peaking. */
+static int zebra_liveview_trigger_active()
+{
+#ifdef CONFIG_6D2
+    return lv && get_global_draw() && !gui_menu_shown() &&
+           focus_peaking_trigger_active();
+#else
+    return 1;
+#endif
+}
+
 int focus_peaking_as_display_filter() 
 {
     #if defined(CONFIG_DISPLAY_FILTERS) && defined(FEATURE_FOCUS_PEAK_DISP_FILTER)
-    return lv && focus_peaking && focus_peaking_disp;
+    return lv && focus_peaking && focus_peaking_disp && !focus_peaking_is_paused() &&
+           focus_peaking_trigger_active() && get_global_draw();
     #else
     return 0;
     #endif
@@ -418,7 +489,7 @@ int get_global_draw() // menu setting, or off if
          *    0x3 - clean overlays
          *    0x6 - OlcApp? The screen like outside LV on DSLR
          * EOSM and 5D2 already used this value in the past, and it was also "3"
-         * for clean overlays.
+         * for clean overalys.
          */
         lv_disp_mode = LV_OVERLAYS_MODE != 3;
     #endif
@@ -803,7 +874,7 @@ static void FAST draw_zebras_raw_lv()
 {
     if (!raw_update_params()) return;
 
-    uint8_t * const bvram = bmp_vram_real();
+    uint8_t * const bvram = zebra_overlay_vram();
     if (!bvram) return;
     uint8_t * const bvram_mirror = get_bvram_mirror();
     if (!bvram_mirror) return;
@@ -903,6 +974,11 @@ int get_under_and_over_exposure(int thr_lo, int thr_hi, int* under, int* over)
 #define ZEBRA_COLOR_WORD_SOLID(x) ( (x) | (x)<<8 | (x)<<16 | (x)<<24 )
 static int zebra_rgb_color(int underexposed, int clipR, int clipG, int clipB, int y)
 {
+#ifdef CONFIG_6D2
+    if (underexposed || clipR || clipG || clipB)
+        return zebra_line_color_word(COLOR_BLACK, y);
+    return 0;
+#else
     if (underexposed) return zebra_color_word_row(79, y);
     
     switch ((clipR ? 4 : 0) |
@@ -918,6 +994,7 @@ static int zebra_rgb_color(int underexposed, int clipR, int clipG, int clipB, in
         case 0b010: return y&2 ? 0 : ZEBRA_COLOR_WORD_SOLID(COLOR_GREEN2);
         default: return 0;
     }
+#endif
 }
 
 static int zebra_rgb_solid_color(int underexposed, int clipR, int clipG, int clipB)
@@ -1074,6 +1151,15 @@ void bvram_mirror_init()
 #ifdef FEATURE_FOCUS_PEAK
 static int get_focus_color(int thr, int d)
 {
+#ifdef CONFIG_6D2
+    /* Keep legacy Global/Local settings monochrome on 6D2. */
+    if (focus_peaking_color == 8)
+    {
+        return 76 + COERCE(focus_peaking_alpha, 0, 3);
+    }
+    if (focus_peaking_color == 6) return COLOR_RED;
+    if (focus_peaking_color == 7) return COLOR_RED;
+#endif
     return
         focus_peaking_color == 0 ? COLOR_RED :
         focus_peaking_color == 1 ? 7 :
@@ -1117,6 +1203,22 @@ static inline int zebra_color_word_row(int c, int y)
     }
     return cw;
 }
+
+static int zebra_line_color_word(int c, int y)
+{
+#ifdef CONFIG_6D2
+    if (!c) return 0;
+    switch (y & 3)
+    {
+        case 0: return c | c << 8 | c << 16;
+        case 1: return c << 8 | c << 16 | c << 24;
+        case 2: return c << 16 | c << 24 | c;
+        default: return c << 24 | c | c << 8;
+    }
+#else
+    return zebra_color_word_row(c, y);
+#endif
+}
 #endif
 
 #ifdef FEATURE_FOCUS_PEAK
@@ -1157,16 +1259,58 @@ static void zebra_update_lut()
 
 #ifdef FEATURE_ZEBRA
 
+#ifdef CONFIG_6D2
+#define ZEBRA_TRACKED_WORDS (BMP_VRAM_SIZE / sizeof(uint32_t))
+static uint32_t zebra_dirty_words[(ZEBRA_TRACKED_WORDS + 31) / 32];
+static int zebra_was_active = 0;
+
+static inline void zebra_track_word(uint8_t *bvram, uint32_t *word)
+{
+    int index = word - (uint32_t *)bvram;
+    if (index >= 0 && index < ZEBRA_TRACKED_WORDS)
+        zebra_dirty_words[index >> 5] |= 1u << (index & 31);
+}
+
+static void zebra_clear_tracked_words(uint8_t *bvram)
+{
+    if (!bvram || !bvram_mirror) return;
+    uint32_t *buffer = (uint32_t *)bvram;
+    uint32_t *mirror = (uint32_t *)bvram_mirror;
+    for (int i = 0; i < ZEBRA_TRACKED_WORDS; i++)
+    {
+        if (!(zebra_dirty_words[i >> 5] & (1u << (i & 31)))) continue;
+        int y = (i * (int)sizeof(uint32_t)) / BMPPITCH;
+        uint32_t expected = zebra_line_color_word(COLOR_BLACK, y);
+        if (buffer[i] == mirror[i] && buffer[i] == expected)
+            buffer[i] = mirror[i] = 0;
+    }
+    for (int i = 0; i < COUNT(zebra_dirty_words); i++) zebra_dirty_words[i] = 0;
+    ml_refresh_display_needed = 1;
+}
+#endif
+
 #ifdef FEATURE_ZEBRA_FAST
 static int zebra_digic_dirty = 0;
 #endif
 
 static void draw_zebras( int Z )
 {
-    uint8_t * const bvram = bmp_vram_real();
-    int zd = Z && zebra_draw && (lv_luma_is_accurate() || PLAY_OR_QR_MODE) && (zebra_rec || NOT_RECORDING); // when to draw zebras
+    uint8_t * const bvram = zebra_overlay_vram();
+    int zebra_enabled_now = zebra_draw && (lv_luma_is_accurate() || PLAY_OR_QR_MODE) && (zebra_rec || NOT_RECORDING);
+#ifdef CONFIG_6D2
+    zebra_enabled_now = zebra_enabled_now && zebra_liveview_trigger_active();
+    if (!zebra_enabled_now && zebra_was_active)
+    {
+        zebra_clear_tracked_words(bvram);
+        zebra_was_active = 0;
+    }
+#endif
+    int zd = Z && zebra_enabled_now;
     if (zd)
     {
+#ifdef CONFIG_6D2
+        zebra_was_active = 1;
+#endif
         #ifdef FEATURE_RAW_ZEBRAS
         if (RAW_ZEBRA_ENABLE && can_use_raw_overlays())
         {
@@ -1262,10 +1406,17 @@ static void draw_zebras( int Z )
         int off = get_y_skip_offset_for_overlays();
         for(int y = os.y0 + off; y < os.y_max - off; y += 2 )
         {
+            #ifdef CONFIG_6D2
+            #define color_over           zebra_line_color_word(COLOR_BLACK, y)
+            #define color_under          zebra_line_color_word(COLOR_BLACK, y)
+            #define color_over_2         zebra_line_color_word(COLOR_BLACK, y+1)
+            #define color_under_2        zebra_line_color_word(COLOR_BLACK, y+1)
+            #else
             #define color_over           zebra_color_word_row(COLOR_RED,  y)
             #define color_under          zebra_color_word_row(COLOR_BLUE, y)
             #define color_over_2         zebra_color_word_row(COLOR_RED,  y+1)
             #define color_under_2        zebra_color_word_row(COLOR_BLUE, y+1)
+            #endif
             
             #define color_rgb_under      zebra_rgb_color(1, 0, 0, 0, y)
             #define color_rgb_under_2    zebra_rgb_color(1, 0, 0, 0, y+1)
@@ -1304,6 +1455,18 @@ static void draw_zebras( int Z )
                 #define MP (*mp)
                 #define BN (*(bp + BMPPITCH/4))
                 #define MN (*(mp + BMPPITCH/4))
+#ifdef CONFIG_6D2
+                #define ZEBRA_WRITE_PAIR(top, bottom) do { \
+                    uint32_t zebra_top_color = (top); \
+                    uint32_t zebra_bottom_color = (bottom); \
+                    BP = MP = zebra_top_color; \
+                    BN = MN = zebra_bottom_color; \
+                    if (zebra_top_color) zebra_track_word(bvram, bp); \
+                    if (zebra_bottom_color) zebra_track_word(bvram, bp + BMPPITCH/4); \
+                } while (0)
+#else
+                #define ZEBRA_WRITE_PAIR(top, bottom) do { BP = MP = (top); BN = MN = (bottom); } while (0)
+#endif
                 if (BP != 0 && BP != MP) { little_cleanup(bp, mp); continue; }
                 if (BN != 0 && BN != MN) { little_cleanup(bp + (BMPPITCH >> 2), mp + (BMPPITCH >> 2)); continue; }
                 if ((MP & 0x80808080) || (MN & 0x80808080)) continue;
@@ -1316,8 +1479,7 @@ static void draw_zebras( int Z )
 
                     if(unlikely(Y < zll)) // underexposed
                     {
-                        BP = MP = color_rgb_under;
-                        BN = MN = color_rgb_under_2;
+                        ZEBRA_WRITE_PAIR(color_rgb_under, color_rgb_under_2);
                     }
                     else
                     {
@@ -1330,26 +1492,22 @@ static void draw_zebras( int Z )
                             {
                                 if (B > zlb) // RGB clipped (all of them)
                                 {
-                                    BP = MP = color_rgb_clipRGB;
-                                    BN = MN = color_rgb_clipRGB_2;
+                                    ZEBRA_WRITE_PAIR(color_rgb_clipRGB, color_rgb_clipRGB_2);
                                 }
                                 else // only R and G clipped
                                 {
-                                    BP = MP = color_rgb_clipRG;
-                                    BN = MN = color_rgb_clipRG_2;
+                                    ZEBRA_WRITE_PAIR(color_rgb_clipRG, color_rgb_clipRG_2);
                                 }
                             }
                             else // R clipped, G not clipped
                             {
                                 if (unlikely(B > zlb)) // only R and B clipped
                                 {
-                                    BP = MP = color_rgb_clipRB;
-                                    BN = MN = color_rgb_clipRB_2;
+                                    ZEBRA_WRITE_PAIR(color_rgb_clipRB, color_rgb_clipRB_2);
                                 }
                                 else // only R clipped
                                 {
-                                    BP = MP = color_rgb_clipR;
-                                    BN = MN = color_rgb_clipR_2;
+                                    ZEBRA_WRITE_PAIR(color_rgb_clipR, color_rgb_clipR_2);
                                 }
                             }
                         }
@@ -1359,21 +1517,18 @@ static void draw_zebras( int Z )
                             {
                                 if (unlikely(B > zlb)) // only G and B clipped
                                 {
-                                    BP = MP = color_rgb_clipGB;
-                                    BN = MN = color_rgb_clipGB_2;
+                                    ZEBRA_WRITE_PAIR(color_rgb_clipGB, color_rgb_clipGB_2);
                                 }
                                 else // only G clipped
                                 {
-                                    BP = MP = color_rgb_clipG;
-                                    BN = MN = color_rgb_clipG_2;
+                                    ZEBRA_WRITE_PAIR(color_rgb_clipG, color_rgb_clipG_2);
                                 }
                             }
                             else // R not clipped, G not clipped
                             {
                                 if (unlikely(B > zlb)) // only B clipped
                                 {
-                                    BP = MP = color_rgb_clipB;
-                                    BN = MN = color_rgb_clipB_2;
+                                    ZEBRA_WRITE_PAIR(color_rgb_clipB, color_rgb_clipB_2);
                                 }
                                 else // nothing clipped
                                 {
@@ -1388,18 +1543,17 @@ static void draw_zebras( int Z )
                     int p0 = (*lvp) >> 8 & 0xFF;
                     if (unlikely(p0 > zlh))
                     {
-                        BP = MP = color_over;
-                        BN = MN = color_over_2;
+                        ZEBRA_WRITE_PAIR(color_over, color_over_2);
                     }
                     else if (unlikely(p0 < zll))
                     {
-                        BP = MP = color_under;
-                        BN = MN = color_under_2;
+                        ZEBRA_WRITE_PAIR(color_under, color_under_2);
                     }
                     else
                         BN = MN = BP = MP = 0;
                 }
                     
+                #undef ZEBRA_WRITE_PAIR
                 #undef MP
                 #undef BP
                 #undef BN
@@ -1709,7 +1863,7 @@ draw_zebra_and_focus( int Z, int F )
 {
     if (unlikely(!get_global_draw())) return 0;
 
-    uint8_t * const bvram = bmp_vram_real();
+    uint8_t * const bvram = zebra_overlay_vram();
     if (unlikely(!bvram)) return 0;
     if (unlikely(!bvram_mirror)) return 0;
     
@@ -1718,7 +1872,8 @@ draw_zebra_and_focus( int Z, int F )
     #endif
     
     #ifdef FEATURE_FOCUS_PEAK
-    if (focus_peaking && focus_peaking_disp && !EXT_MONITOR_CONNECTED)
+    if (focus_peaking && focus_peaking_disp && !EXT_MONITOR_CONNECTED &&
+        !focus_peaking_is_paused() && focus_peaking_trigger_active())
     {
         if (lv) 
         {
@@ -1736,7 +1891,9 @@ draw_zebra_and_focus( int Z, int F )
     static int prev_thr = 50;
     static int thr_delta = 0;
 
-    if (F && focus_peaking)
+    static int focus_peaking_was_active = 0;
+    int focus_active = focus_peaking && !focus_peaking_is_paused() && focus_peaking_trigger_active();
+    if (F && (focus_active || focus_peaking_was_active))
     {
         // clear previously written pixels
         if (unlikely(!dirty_pixels)) dirty_pixels = malloc(MAX_DIRTY_PIXELS * sizeof(int));
@@ -1762,8 +1919,38 @@ draw_zebra_and_focus( int Z, int F )
             #undef M2
         }
         dirty_pixels_num = 0;
+
+        if (!focus_active)
+        {
+            /* Remove marks from the bitmap when the shutter is released or
+             * after a photo, before leaving the peaking path idle. */
+            focus_peaking_was_active = 0;
+#ifdef FEATURE_VRAM_RGBA
+            ml_refresh_display_needed = 1;
+#endif
+            return 0;
+        }
+        focus_peaking_was_active = 1;
+
+#ifdef CONFIG_6D2
+        /* Focus peaking is for Live View. Avoid a full-resolution playback
+         * scan after each shot, which competes with camera work. */
+        if (!lv)
+        {
+#ifdef FEATURE_VRAM_RGBA
+            ml_refresh_display_needed = 1;
+#endif
+            return 0;
+        }
+#endif
         
+        #ifdef CONFIG_6D2
+        /* The active display pointer is unknown on 6D2; let the user test each
+         * candidate LiveView buffer. Focus peaking only reads this buffer. */
+        uint32_t vram = (uint32_t)CACHEABLE(focus_peak_buffer_source_address());
+        #else
         uint32_t vram = (uint32_t)CACHEABLE(YUV422_LV_BUFFER_DISPLAY_ADDR);
+        #endif
         if (!vram) return 0;
         
         int off = get_y_skip_offset_for_overlays();
@@ -1796,8 +1983,13 @@ draw_zebra_and_focus( int Z, int F )
         int n_total = 0;
         if (lv) // fast, realtime
         {
-            n_total = ((yEnd - yStart) * (xEnd - xStart)) / 6;
-            for(int y = yStart; y < yEnd; y += 3)
+            #ifdef CONFIG_6D2
+            const int y_step = 2; /* denser connected 2x2 marks for 6D2 Live View */
+            #else
+            const int y_step = 3;
+            #endif
+            n_total = ((yEnd - yStart) * (xEnd - xStart)) / (2 * y_step);
+            for(int y = yStart; y < yEnd; y += y_step)
             {
                 uint32_t row = vram + BM2LV_R(y);
                 
@@ -1860,6 +2052,11 @@ draw_zebra_and_focus( int Z, int F )
         int thr_min = 15;
         thr = COERCE(thr, thr_min, 255);
 
+#ifdef FEATURE_VRAM_RGBA
+        /* Pixel writes update ML's indexed staging buffer. */
+        if (dirty_pixels_num)
+            ml_refresh_display_needed = 1;
+#endif
 
         thr_delta = thr - prev_thr;
         prev_thr = thr;
@@ -1925,7 +2122,7 @@ clrscr_mirror( void )
 #ifdef FEATURE_ZEBRA
 static MENU_UPDATE_FUNC(zebra_draw_display)
 {
-    unsigned z = MENU_CURRENT_VALUE;
+    unsigned z = CURRENT_VALUE;
     
     int over_disabled = (zebra_level_hi > 100);
     int under_disabled = (zebra_level_lo == 0);
@@ -1980,7 +2177,7 @@ static MENU_UPDATE_FUNC(zebra_param_not_used_for_raw)
 
 static MENU_UPDATE_FUNC(zebra_level_display)
 {
-    int level = MENU_CURRENT_VALUE;
+    int level = CURRENT_VALUE;
     if (level == 0 || level > 100)
     {
         MENU_SET_VALUE("Disabled");
@@ -2004,7 +2201,7 @@ static MENU_UPDATE_FUNC(zebra_level_display)
 #ifdef FEATURE_FOCUS_PEAK
 static MENU_UPDATE_FUNC(focus_peaking_display)
 {
-    unsigned f = MENU_CURRENT_VALUE;
+    unsigned f = CURRENT_VALUE;
     if (f)
         MENU_SET_VALUE(
             "ON,%d.%d,%s%s",
@@ -2015,8 +2212,15 @@ static MENU_UPDATE_FUNC(focus_peaking_display)
             focus_peaking_color == 3 ? "C" :
             focus_peaking_color == 4 ? "M" :
             focus_peaking_color == 5 ? "Y" :
+#ifdef CONFIG_6D2
+            focus_peaking_color == 6 ? "R" :
+            focus_peaking_color == 7 ? "R" :
+            focus_peaking_color == 8 ? "soft red" : "err",
+#else
             focus_peaking_color == 6 ? "global" :
-            focus_peaking_color == 7 ? "local" : "err",
+            focus_peaking_color == 7 ? "local" :
+            focus_peaking_color == 8 ? "soft red" : "err",
+#endif
             focus_peaking_grayscale ? ",Gray" : ""
         );
 }
@@ -2027,6 +2231,40 @@ static void focus_peaking_adjust_thr(void* priv, int delta)
     if ((int)focus_peaking_pthr > 50) focus_peaking_pthr = 1;
     if ((int)focus_peaking_pthr <= 0) focus_peaking_pthr = 50;
 }
+
+#ifdef CONFIG_6D2
+/* Read-only probe for the three SRM video buffers identified on 6D2.
+ * Compare average luma under different scenes to identify image buffers.
+ * Do not write to these buffers from this diagnostic.
+ */
+static uint32_t focus_peak_buffer_luma(uint32_t address)
+{
+    volatile const uint32_t *buffer = (volatile const uint32_t *)CACHEABLE(address);
+    uint32_t sum = 0;
+    uint32_t samples = 0;
+
+    for (int y = 8; y < 480; y += 48)
+    {
+        for (int x = 8; x < 720; x += 48)
+        {
+            uint32_t offset = y * YUV422_LV_PITCH + x * 2;
+            sum += UYVY_GET_AVG_Y(buffer[offset / 4]);
+            samples++;
+        }
+    }
+
+    return samples ? sum / samples : 0;
+}
+
+static MENU_UPDATE_FUNC(focus_peak_buffer_probe_display)
+{
+    MENU_SET_VALUE("Y A:%3d B:%3d C:%3d",
+        focus_peak_buffer_luma(YUV422_LV_BUFFER_1),
+        focus_peak_buffer_luma(YUV422_LV_BUFFER_2),
+        focus_peak_buffer_luma(YUV422_LV_BUFFER_3)
+    );
+}
+#endif
 #endif
 
 #ifdef FEATURE_WAVEFORM
@@ -2826,8 +3064,13 @@ struct menu_entry zebra_menus[] = {
             {
                 .name = "Color", 
                 .priv = &focus_peaking_color,
+#ifdef CONFIG_6D2
+                .max = 8,
+                .choices = (const char *[]) {"Red", "Green", "Blue", "Cyan", "Magenta", "Yellow", "Red", "Red", "Soft red"},
+#else
                 .max = 7,
                 .choices = (const char *[]) {"Red", "Green", "Blue", "Cyan", "Magenta", "Yellow", "Global Focus", "Local Focus"},
+#endif
                 .help = "Focus peaking color (fixed or color coding).",
                 .icon_type = IT_DICE,
             },
@@ -2837,6 +3080,27 @@ struct menu_entry zebra_menus[] = {
                 .max = 1,
                 .help = "Display LiveView image in grayscale.",
             },
+            #ifdef CONFIG_6D2
+            {
+                .name = "Soft red opacity",
+                .priv = &focus_peaking_alpha,
+                .max = 3,
+                .choices = (const char *[]) {"Very faint", "Faint", "Medium", "Strong"},
+                .help = "Opacity for the Soft red focus peaking color.",
+            },
+            {
+                .name = "LV buffer source",
+                .priv = &focus_peak_buffer_source,
+                .max = 2,
+                .choices = (const char *[]) {"A", "B", "C"},
+                .help = "Select which candidate 6D2 LiveView buffer Focus Peak reads. Try A, B and C.",
+            },
+            {
+                .name = "LV buffer probe (read only)",
+                .update = focus_peak_buffer_probe_display,
+                .help = "Average luma in the three 6D2 LiveView buffers. Read-only diagnostic.",
+            },
+            #endif
             MENU_EOL
         },
     },
@@ -4009,6 +4273,8 @@ int is_focus_peaking_enabled()
         focus_peaking &&
         (lv || (QR_MODE && ZEBRAS_IN_QUICKREVIEW))
         && get_global_draw()
+        && !focus_peaking_is_paused()
+        && focus_peaking_trigger_active()
         && !should_draw_zoom_overlay()
     ;
 #else
@@ -4064,7 +4330,10 @@ livev_hipriority_task( void* unused )
             msleep(100);
         }
 
-        int zd = zebra_draw && (lv_luma_is_accurate() || PLAY_OR_QR_MODE) && (zebra_rec || NOT_RECORDING); // when to draw zebras (should match the one from draw_zebra_and_focus)
+        int zd = zebra_draw && (lv_luma_is_accurate() || PLAY_OR_QR_MODE) && (zebra_rec || NOT_RECORDING); // when to draw zebras (should match one-shot gating too)
+#ifdef CONFIG_6D2
+        zd = zd && zebra_liveview_trigger_active();
+#endif
         if (!zd) digic_zebra_cleanup();
         
 #ifdef CONFIG_RAW_LIVEVIEW
@@ -4164,7 +4433,14 @@ livev_hipriority_task( void* unused )
             if (!zoom_overlay_dirty) { redraw(); msleep(700); } // redraw cropmarks after MZ is turned off
             zoom_overlay_dirty = 1;
 
-            msleep(10);
+            /* When peaking is enabled but hidden on another LiveView page,
+             * keep the worker mostly asleep. It wakes promptly when the user
+             * returns to the configured overlay screen. */
+            int overlays_waiting_for_halfpress =
+                (focus_peaking &&
+                 (!focus_peaking_trigger_active() || focus_peaking_is_paused())) ||
+                (zebra_draw && !zebra_liveview_trigger_active());
+            msleep(overlays_waiting_for_halfpress ? 40 : 10);
 
             #ifdef CONFIG_DISPLAY_FILTERS
             /* to refactor with CBR */
@@ -4601,7 +4877,7 @@ static void show_overlay()
     }
 
     get_yuv422_vram();
-    uint8_t * const bvram = bmp_vram_real();
+    uint8_t * const bvram = zebra_overlay_vram();
     if (!bvram) return;
     
     clrscr();

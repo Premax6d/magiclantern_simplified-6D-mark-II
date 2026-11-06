@@ -458,6 +458,11 @@ int handle_common_events_by_feature(struct event * event)
     /* log button codes, if enabled from the Debug menu */
     spy_event(event);
 
+#if defined(CONFIG_6D2) && defined(FEATURE_FOCUS_PEAK)
+    /* Let peaking resume only on a fresh half-press after capturing a photo. */
+    focus_peaking_handle_button_event(event);
+#endif
+
 #ifdef FEATURE_POWERSAVE_LIVEVIEW
     // these are required for correct shutdown from "LV paused" state
     if (event->param == GMT_GUICMD_START_AS_CHECK || 
